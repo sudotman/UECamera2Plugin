@@ -7,6 +7,7 @@
 #include "RHI.h"
 #include "RHICommandList.h"
 #include "Rendering/Texture2DResource.h"
+#include "RenderingThread.h"
 
 DEFINE_LOG_CATEGORY(LogSimpleCamera2);
 
@@ -177,89 +178,87 @@ static bool EnsureCamera2HelperInstance(JNIEnv* Env)
 // JNI callback for real Camera2 frames
 #if PLATFORM_ANDROID
 extern "C" JNIEXPORT void JNICALL
-Java_com_epicgames_ue4_Camera2Helper_onFrameAvailable(JNIEnv* env, jclass clazz, 
-    jbyteArray data, jint width, jint height)
+Java_com_epicgames_ue4_Camera2Helper_onFrameAvailable(
+    JNIEnv* env, jclass clazz, jbyteArray data, jint width, jint height)
 {
+    // Early exit if camera is being stopped
+    if (!bCameraPreviewActive)
+    {
+        return;
+    }
+
     static bool bCamera2LogsOnce = false;
     if (!bCamera2LogsOnce)
     {
-        UE_LOG(LogSimpleCamera2, Log, TEXT("Camera2 frame received: %dx%d"), width, height);
+        UE_LOG(LogSimpleCamera2, Log,
+            TEXT("Camera2 frame received: %dx%d"), width, height);
     }
-    
+
+    // Check texture validity
     if (!CameraTexture || !data)
     {
         if (!bCamera2LogsOnce)
         {
-            UE_LOG(LogSimpleCamera2, Warning, TEXT("CameraTexture or data is null"));
+            UE_LOG(LogSimpleCamera2, Warning,
+                TEXT("CameraTexture or data is null"));
         }
         bCamera2LogsOnce = true;
         return;
     }
-        
+
     // Get frame data from Java
     jbyte* frameData = env->GetByteArrayElements(data, nullptr);
     if (!frameData)
     {
         if (!bCamera2LogsOnce)
         {
-            UE_LOG(LogSimpleCamera2, Error, TEXT("Failed to get frame data from Java"));
+            UE_LOG(LogSimpleCamera2, Error,
+                TEXT("Failed to get frame data from Java"));
         }
         bCamera2LogsOnce = true;
         return;
     }
-    
-    // Copy frame data to avoid issues with async access
+
+    // Copy frame data
     int32 DataSize = width * height * 4;
     uint8* FrameDataCopy = new uint8[DataSize];
     FMemory::Memcpy(FrameDataCopy, frameData, DataSize);
-    
-    // Check first few bytes of frame data
-    if (!bCamera2LogsOnce)
-    {
-        UE_LOG(LogSimpleCamera2, Warning, TEXT("Frame data sample: [%d, %d, %d, %d, %d, %d, %d, %d]"), 
-            FrameDataCopy[0], FrameDataCopy[1], FrameDataCopy[2], FrameDataCopy[3],
-            FrameDataCopy[4], FrameDataCopy[5], FrameDataCopy[6], FrameDataCopy[7]);
-    }
-    
+
     // Release Java array immediately
     env->ReleaseByteArrayElements(data, frameData, JNI_ABORT);
-        
-    // Helper: enqueue render-thread texture update taking ownership of buffer
-    auto EnqueueTextureUpdateOwned = [](UTexture2D* Texture, uint8* OwnedBuffer, int32 W, int32 H)
-    {
-        if (!Texture || !Texture->GetResource())
-        {
-            if (OwnedBuffer) { delete[] OwnedBuffer; }
-            return;
-        }
-        FTexture2DResource* TextureResource = static_cast<FTexture2DResource*>(Texture->GetResource());
-        const uint32 SrcPitch = static_cast<uint32>(W) * 4u;
-        FUpdateTextureRegion2D Region(0, 0, 0, 0, static_cast<uint32>(W), static_cast<uint32>(H));
-        ENQUEUE_RENDER_COMMAND(UpdateCameraTexture2D)(
-            [TextureResource, Region, OwnedBuffer, SrcPitch](FRHICommandListImmediate& RHICmdList)
-            {
-                RHICmdList.UpdateTexture2D(TextureResource->GetTexture2DRHI(), 0, Region, SrcPitch, OwnedBuffer);
-                delete[] OwnedBuffer;
-            });
-    };
 
-    // Update texture on game thread, then enqueue render update
-    AsyncTask(ENamedThreads::Type::GameThread, [FrameDataCopy, width, height, DataSize, EnqueueTextureUpdateOwned]()
-    {
-        if (CameraTexture)
+    // Update texture safely with validity check
+    AsyncTask(ENamedThreads::GameThread,
+        [FrameDataCopy, width, height]()
         {
-            EnqueueTextureUpdateOwned(CameraTexture, FrameDataCopy, width, height);
-            if (!bCamera2LogsOnce)
+            // Double-check camera is still active and texture exists
+            if (bCameraPreviewActive && CameraTexture &&
+                CameraTexture->GetResource())
             {
-                UE_LOG(LogSimpleCamera2, Warning, TEXT("Camera2 frame enqueued to render thread: %dx%d, DataSize: %d"), width, height, DataSize);
+                FTexture2DResource* TextureResource =
+                    static_cast<FTexture2DResource*>(CameraTexture->GetResource());
+                const uint32 SrcPitch = static_cast<uint32>(width) * 4u;
+                FUpdateTextureRegion2D Region(0, 0, 0, 0,
+                    static_cast<uint32>(width), static_cast<uint32>(height));
+
+                ENQUEUE_RENDER_COMMAND(UpdateCameraTexture2D)(
+                    [TextureResource, Region, FrameDataCopy, SrcPitch]
+                    (FRHICommandListImmediate& RHICmdList)
+                    {
+                        RHICmdList.UpdateTexture2D(
+                            TextureResource->GetTexture2DRHI(),
+                            0, Region, SrcPitch, FrameDataCopy);
+                        delete[] FrameDataCopy;
+                    });
             }
-        }
-        else
-        {
-            delete[] FrameDataCopy;
-        }
-        bCamera2LogsOnce = true;
-    });
+            else
+            {
+                // Clean up if camera was stopped
+                delete[] FrameDataCopy;
+            }
+        });
+
+    bCamera2LogsOnce = true;
 }
 #endif
 
@@ -744,43 +743,79 @@ bool USimpleCamera2Test::StartCameraPreview()
 void USimpleCamera2Test::StopCameraPreview()
 {
     UE_LOG(LogSimpleCamera2, Log, TEXT("Stopping real Camera2 preview"));
-    
+
+    // Set flag immediately to prevent new frame processing
+    bCameraPreviewActive = false;
+
 #if PLATFORM_ANDROID
-    // Stop Camera2 helper
     if (Camera2HelperInstance)
     {
         JNIEnv* Env = FAndroidApplication::GetJavaEnv();
         if (Env)
         {
-            jclass Camera2Class = Env->FindClass("com/epicgames/ue4/Camera2Helper");
+            // Get the class from the existing instance (not FindClass!)
+            jclass Camera2Class = Env->GetObjectClass(Camera2HelperInstance);
             if (Camera2Class)
             {
-                jmethodID StopMethod = Env->GetMethodID(Camera2Class, "stopCamera", "()V");
+                jmethodID StopMethod = Env->GetMethodID(Camera2Class,
+                    "stopCamera", "()V");
                 if (StopMethod)
                 {
+                    UE_LOG(LogSimpleCamera2, Log,
+                        TEXT("Calling stopCamera method..."));
                     Env->CallVoidMethod(Camera2HelperInstance, StopMethod);
+
+                    // Check for exceptions
+                    if (Env->ExceptionCheck())
+                    {
+                        UE_LOG(LogSimpleCamera2, Error,
+                            TEXT("Exception calling stopCamera"));
+                        Env->ExceptionDescribe();
+                        Env->ExceptionClear();
+                    }
+                    else
+                    {
+                        UE_LOG(LogSimpleCamera2, Log,
+                            TEXT("stopCamera completed successfully"));
+                    }
                 }
+                else
+                {
+                    UE_LOG(LogSimpleCamera2, Error,
+                        TEXT("stopCamera method not found"));
+                }
+
+                // Clean up local reference
+                Env->DeleteLocalRef(Camera2Class);
             }
-            
+
+            // Delete global reference
             Env->DeleteGlobalRef(Camera2HelperInstance);
             Camera2HelperInstance = nullptr;
+            UE_LOG(LogSimpleCamera2, Log,
+                TEXT("Camera2Helper instance cleaned up"));
         }
     }
+
+    // Small delay to let pending frame callbacks complete
+    FPlatformProcess::Sleep(0.1f);
 #endif
-    
+
+    // Clean up texture
     if (CameraTexture)
     {
+        FlushRenderingCommands();
         CameraTexture->RemoveFromRoot();
         CameraTexture = nullptr;
     }
-    
-    bCameraPreviewActive = false;
-    
+
     if (GEngine)
     {
-        GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Yellow, TEXT("Real Camera2: Stopped"));
+        GEngine->AddOnScreenDebugMessage(-1, 3.0f, FColor::Yellow,
+            TEXT("Real Camera2: Stopped"));
     }
 }
+
 
 UTexture2D* USimpleCamera2Test::GetCameraTexture()
 {
