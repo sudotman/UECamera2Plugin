@@ -217,4 +217,22 @@ public:
     UFUNCTION(BlueprintPure, Category = "Camera2|Selection")
     static bool GetPreferredCamera();
     
+    /**
+     * Get a diagnostic string comparing runtime vs hardcoded calibration values.
+     * Useful for debugging calibration differences between headsets.
+     * 
+     * @param bLeftCamera - true for left camera, false for right
+     * @return Multi-line string showing runtime values, hardcoded values, and differences
+     */
+    UFUNCTION(BlueprintCallable, Category = "Camera2|Diagnostics")
+    static FString GetCalibrationDiagnostics(bool bLeftCamera = true);
+    
+    /**
+     * Check if runtime calibration data is available from the device.
+     * @param bOutHasIntrinsics - set to true if runtime intrinsics are available
+     * @param bOutHasPose - set to true if runtime pose is available
+     */
+    UFUNCTION(BlueprintCallable, Category = "Camera2|Diagnostics")
+    static void IsRuntimeCalibrationAvailable(bool& bOutHasIntrinsics, bool& bOutHasPose);
+    
 };

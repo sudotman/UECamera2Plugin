@@ -1359,24 +1359,83 @@ FQuest3CameraCalibration USimpleCamera2Test::GetQuest3Calibration(bool bLeftCame
     Calib.bIsLeftCamera = bLeftCamera;
     Calib.CameraId = bLeftCamera ? TEXT("50") : TEXT("51");
     
-    // Native resolution
-    Calib.NativeWidth = NativeWidth;
-    Calib.NativeHeight = NativeHeight;
+    // =========================================================================
+    // PREFER RUNTIME CALIBRATION FROM DEVICE
+    // Each Quest 3 unit has unique factory calibration stored on-device.
+    // Using hardcoded values causes errors because manufacturing tolerances
+    // mean each headset has slightly different lens positions and focal lengths.
+    // =========================================================================
     
-    // Native intrinsics (before any scaling/cropping)
-    if (bLeftCamera)
+    bool bUsingRuntimeIntrinsics = false;
+    bool bUsingRuntimePose = false;
+    
+    // Check if we have runtime intrinsics from Camera2 API
+    // Runtime intrinsics are in CALIBRATION resolution (typically 1280x1280)
+    const bool bHaveRuntimeIntrinsics = (GCameraFx > 0.0f && GCameraFy > 0.0f && 
+                                          GCameraCalibWidth > 0 && GCameraCalibHeight > 0);
+    
+    if (bHaveRuntimeIntrinsics)
     {
-        Calib.NativeFx = LeftFx;
-        Calib.NativeFy = LeftFy;
-        Calib.NativeCx = LeftCx;
-        Calib.NativeCy = LeftCy;
+        // Use runtime intrinsics from this specific device
+        Calib.NativeWidth = GCameraCalibWidth;
+        Calib.NativeHeight = GCameraCalibHeight;
+        Calib.NativeFx = GCameraFx;
+        Calib.NativeFy = GCameraFy;
+        Calib.NativeCx = GCameraCx;
+        Calib.NativeCy = GCameraCy;
+        bUsingRuntimeIntrinsics = true;
+        
+        // Log comparison with hardcoded values for debugging
+        const float HardcodedFx = bLeftCamera ? LeftFx : RightFx;
+        const float HardcodedCx = bLeftCamera ? LeftCx : RightCx;
+        const float HardcodedCy = bLeftCamera ? LeftCy : RightCy;
+        
+        const float FxDiff = FMath::Abs(GCameraFx - HardcodedFx);
+        const float CxDiff = FMath::Abs(GCameraCx - HardcodedCx);
+        const float CyDiff = FMath::Abs(GCameraCy - HardcodedCy);
+        
+        UE_LOG(LogSimpleCamera2, Warning,
+            TEXT("CALIBRATION: Using RUNTIME intrinsics from device"));
+        UE_LOG(LogSimpleCamera2, Warning,
+            TEXT("  Runtime:   Fx=%.2f Fy=%.2f Cx=%.2f Cy=%.2f (%dx%d)"),
+            GCameraFx, GCameraFy, GCameraCx, GCameraCy, GCameraCalibWidth, GCameraCalibHeight);
+        UE_LOG(LogSimpleCamera2, Warning,
+            TEXT("  Hardcoded: Fx=%.2f Fy=%.2f Cx=%.2f Cy=%.2f (1280x1280)"),
+            HardcodedFx, bLeftCamera ? LeftFy : RightFy, HardcodedCx, HardcodedCy);
+        UE_LOG(LogSimpleCamera2, Warning,
+            TEXT("  Difference: dFx=%.2f dCx=%.2f dCy=%.2f pixels"),
+            FxDiff, CxDiff, CyDiff);
+        
+        // Warn if differences are significant (>1 pixel can cause noticeable errors)
+        if (FxDiff > 5.0f || CxDiff > 5.0f || CyDiff > 5.0f)
+        {
+            UE_LOG(LogSimpleCamera2, Warning,
+                TEXT("  >>> SIGNIFICANT CALIBRATION DIFFERENCE DETECTED! This device differs from reference."));
+        }
     }
     else
     {
-        Calib.NativeFx = RightFx;
-        Calib.NativeFy = RightFy;
-        Calib.NativeCx = RightCx;
-        Calib.NativeCy = RightCy;
+        // Fall back to hardcoded values
+        Calib.NativeWidth = NativeWidth;
+        Calib.NativeHeight = NativeHeight;
+        
+        if (bLeftCamera)
+        {
+            Calib.NativeFx = LeftFx;
+            Calib.NativeFy = LeftFy;
+            Calib.NativeCx = LeftCx;
+            Calib.NativeCy = LeftCy;
+        }
+        else
+        {
+            Calib.NativeFx = RightFx;
+            Calib.NativeFy = RightFy;
+            Calib.NativeCx = RightCx;
+            Calib.NativeCy = RightCy;
+        }
+        
+        UE_LOG(LogSimpleCamera2, Warning,
+            TEXT("CALIBRATION: Using HARDCODED intrinsics (runtime not available)"));
     }
     
     // Stream resolution and adjusted intrinsics
@@ -1400,8 +1459,8 @@ FQuest3CameraCalibration USimpleCamera2Test::GetQuest3Calibration(bool bLeftCame
     // - CropOffsetY = (1280-960)/2 = 160 pixels cropped from top
     // =========================================================================
     
-    const float CropOffsetX = (static_cast<float>(NativeWidth) - static_cast<float>(StreamWidth)) / 2.0f;
-    const float CropOffsetY = (static_cast<float>(NativeHeight) - static_cast<float>(StreamHeight)) / 2.0f;
+    const float CropOffsetX = (static_cast<float>(Calib.NativeWidth) - static_cast<float>(StreamWidth)) / 2.0f;
+    const float CropOffsetY = (static_cast<float>(Calib.NativeHeight) - static_cast<float>(StreamHeight)) / 2.0f;
     
     // Focal lengths: UNCHANGED for center crop (pixels aren't scaled)
     Calib.StreamFx = Calib.NativeFx;
@@ -1411,24 +1470,61 @@ FQuest3CameraCalibration USimpleCamera2Test::GetQuest3Calibration(bool bLeftCame
     Calib.StreamCx = Calib.NativeCx - CropOffsetX;
     Calib.StreamCy = Calib.NativeCy - CropOffsetY;
     
-    // Camera pose in HMD space (already converted to UE coordinates)
-    if (bLeftCamera)
+    // =========================================================================
+    // CAMERA POSE - PREFER RUNTIME
+    // =========================================================================
+    if (GCameraPoseAvailable)
     {
-        Calib.PoseTranslationCm = ConvertTranslationToUE(LeftTx, LeftTy, LeftTz);
-        Calib.PoseRotation = ConvertRotationToUE(LeftQx, LeftQy, LeftQz, LeftQw);
+        // Use runtime pose from this specific device
+        Calib.PoseTranslationCm = GCameraPoseTranslation;
+        Calib.PoseRotation = GCameraPoseRotation;
+        bUsingRuntimePose = true;
+        
+        // Log comparison with hardcoded
+        const FVector HardcodedTrans = bLeftCamera ? 
+            ConvertTranslationToUE(LeftTx, LeftTy, LeftTz) :
+            ConvertTranslationToUE(RightTx, RightTy, RightTz);
+        
+        const float TransDiff = FVector::Dist(GCameraPoseTranslation, HardcodedTrans);
+        
+        UE_LOG(LogSimpleCamera2, Warning,
+            TEXT("CALIBRATION: Using RUNTIME pose from device"));
+        UE_LOG(LogSimpleCamera2, Warning,
+            TEXT("  Runtime:   [%.2f, %.2f, %.2f] cm"),
+            GCameraPoseTranslation.X, GCameraPoseTranslation.Y, GCameraPoseTranslation.Z);
+        UE_LOG(LogSimpleCamera2, Warning,
+            TEXT("  Hardcoded: [%.2f, %.2f, %.2f] cm"),
+            HardcodedTrans.X, HardcodedTrans.Y, HardcodedTrans.Z);
+        UE_LOG(LogSimpleCamera2, Warning,
+            TEXT("  Difference: %.2f cm"), TransDiff);
     }
     else
     {
-        Calib.PoseTranslationCm = ConvertTranslationToUE(RightTx, RightTy, RightTz);
-        Calib.PoseRotation = ConvertRotationToUE(RightQx, RightQy, RightQz, RightQw);
+        // Fall back to hardcoded pose
+        if (bLeftCamera)
+        {
+            Calib.PoseTranslationCm = ConvertTranslationToUE(LeftTx, LeftTy, LeftTz);
+            Calib.PoseRotation = ConvertRotationToUE(LeftQx, LeftQy, LeftQz, LeftQw);
+        }
+        else
+        {
+            Calib.PoseTranslationCm = ConvertTranslationToUE(RightTx, RightTy, RightTz);
+            Calib.PoseRotation = ConvertRotationToUE(RightQx, RightQy, RightQz, RightQw);
+        }
+        
+        UE_LOG(LogSimpleCamera2, Warning,
+            TEXT("CALIBRATION: Using HARDCODED pose (runtime not available)"));
     }
     
-    UE_LOG(LogSimpleCamera2, Log, 
-        TEXT("Quest3 %s camera calibration: Stream %dx%d, Fx=%.2f Fy=%.2f Cx=%.2f Cy=%.2f, Pose=[%.2f, %.2f, %.2f]cm"),
+    // Final summary log
+    UE_LOG(LogSimpleCamera2, Warning, 
+        TEXT("Quest3 %s camera calibration: Stream %dx%d, Fx=%.2f Fy=%.2f Cx=%.2f Cy=%.2f, Pose=[%.2f, %.2f, %.2f]cm [%s intrinsics, %s pose]"),
         bLeftCamera ? TEXT("LEFT") : TEXT("RIGHT"),
         StreamWidth, StreamHeight,
         Calib.StreamFx, Calib.StreamFy, Calib.StreamCx, Calib.StreamCy,
-        Calib.PoseTranslationCm.X, Calib.PoseTranslationCm.Y, Calib.PoseTranslationCm.Z);
+        Calib.PoseTranslationCm.X, Calib.PoseTranslationCm.Y, Calib.PoseTranslationCm.Z,
+        bUsingRuntimeIntrinsics ? TEXT("RUNTIME") : TEXT("HARDCODED"),
+        bUsingRuntimePose ? TEXT("RUNTIME") : TEXT("HARDCODED"));
     
     return Calib;
 }
@@ -1448,4 +1544,135 @@ FQuest3CameraCalibration USimpleCamera2Test::GetCurrentQuest3Calibration(int32 S
     }
     
     return GetQuest3Calibration(bUseLeft, StreamWidth, StreamHeight);
+}
+
+void USimpleCamera2Test::IsRuntimeCalibrationAvailable(bool& bOutHasIntrinsics, bool& bOutHasPose)
+{
+    bOutHasIntrinsics = (GCameraFx > 0.0f && GCameraFy > 0.0f && 
+                         GCameraCalibWidth > 0 && GCameraCalibHeight > 0);
+    bOutHasPose = GCameraPoseAvailable;
+}
+
+FString USimpleCamera2Test::GetCalibrationDiagnostics(bool bLeftCamera)
+{
+    using namespace Quest3Calibration;
+    
+    FString Result;
+    
+    // Header
+    Result += TEXT("=== QUEST 3 CAMERA CALIBRATION DIAGNOSTICS ===\n");
+    Result += FString::Printf(TEXT("Camera: %s\n\n"), bLeftCamera ? TEXT("LEFT (ID 50)") : TEXT("RIGHT (ID 51)"));
+    
+    // Check runtime availability
+    const bool bHaveRuntimeIntrinsics = (GCameraFx > 0.0f && GCameraFy > 0.0f && 
+                                          GCameraCalibWidth > 0 && GCameraCalibHeight > 0);
+    const bool bHaveRuntimePose = GCameraPoseAvailable;
+    
+    Result += TEXT("--- DATA SOURCE ---\n");
+    Result += FString::Printf(TEXT("Runtime Intrinsics: %s\n"), bHaveRuntimeIntrinsics ? TEXT("AVAILABLE") : TEXT("NOT AVAILABLE"));
+    Result += FString::Printf(TEXT("Runtime Pose: %s\n\n"), bHaveRuntimePose ? TEXT("AVAILABLE") : TEXT("NOT AVAILABLE"));
+    
+    // Hardcoded values
+    const float HardcodedFx = bLeftCamera ? LeftFx : RightFx;
+    const float HardcodedFy = bLeftCamera ? LeftFy : RightFy;
+    const float HardcodedCx = bLeftCamera ? LeftCx : RightCx;
+    const float HardcodedCy = bLeftCamera ? LeftCy : RightCy;
+    
+    const FVector HardcodedTrans = bLeftCamera ? 
+        ConvertTranslationToUE(LeftTx, LeftTy, LeftTz) :
+        ConvertTranslationToUE(RightTx, RightTy, RightTz);
+    const FQuat HardcodedRot = bLeftCamera ?
+        ConvertRotationToUE(LeftQx, LeftQy, LeftQz, LeftQw) :
+        ConvertRotationToUE(RightQx, RightQy, RightQz, RightQw);
+    
+    // INTRINSICS COMPARISON
+    Result += TEXT("--- INTRINSICS (Native Resolution) ---\n");
+    Result += FString::Printf(TEXT("Hardcoded: Fx=%.2f Fy=%.2f Cx=%.2f Cy=%.2f (1280x1280)\n"),
+        HardcodedFx, HardcodedFy, HardcodedCx, HardcodedCy);
+    
+    if (bHaveRuntimeIntrinsics)
+    {
+        Result += FString::Printf(TEXT("Runtime:   Fx=%.2f Fy=%.2f Cx=%.2f Cy=%.2f (%dx%d)\n"),
+            GCameraFx, GCameraFy, GCameraCx, GCameraCy, GCameraCalibWidth, GCameraCalibHeight);
+        
+        const float DeltaFx = GCameraFx - HardcodedFx;
+        const float DeltaFy = GCameraFy - HardcodedFy;
+        const float DeltaCx = GCameraCx - HardcodedCx;
+        const float DeltaCy = GCameraCy - HardcodedCy;
+        
+        Result += FString::Printf(TEXT("Delta:     dFx=%.2f dFy=%.2f dCx=%.2f dCy=%.2f pixels\n"),
+            DeltaFx, DeltaFy, DeltaCx, DeltaCy);
+        
+        // Percentage difference for focal length (important for scale)
+        const float FxPctDiff = (DeltaFx / HardcodedFx) * 100.0f;
+        const float FyPctDiff = (DeltaFy / HardcodedFy) * 100.0f;
+        Result += FString::Printf(TEXT("Fx diff: %.3f%%, Fy diff: %.3f%%\n"), FxPctDiff, FyPctDiff);
+        
+        // Impact analysis
+        if (FMath::Abs(DeltaFx) > 5.0f || FMath::Abs(DeltaCx) > 5.0f || FMath::Abs(DeltaCy) > 5.0f)
+        {
+            Result += TEXT("\n>>> WARNING: Significant intrinsic differences detected!\n");
+            Result += TEXT("    Impact: Pose direction errors proportional to pixel offset.\n");
+            
+            // Estimate angular error from principal point offset
+            // tan(error_angle) ≈ pixel_offset / focal_length
+            const float AngularErrorDeg = FMath::RadiansToDegrees(
+                FMath::Atan(FMath::Max(FMath::Abs(DeltaCx), FMath::Abs(DeltaCy)) / HardcodedFx));
+            Result += FString::Printf(TEXT("    Estimated angular error from PP shift: ~%.2f deg\n"), AngularErrorDeg);
+            Result += FString::Printf(TEXT("    At 10m distance: ~%.1f cm position error\n"), 
+                1000.0f * FMath::Tan(FMath::DegreesToRadians(AngularErrorDeg)));
+        }
+    }
+    else
+    {
+        Result += TEXT("Runtime:   NOT AVAILABLE - using hardcoded values\n");
+    }
+    
+    // POSE COMPARISON
+    Result += TEXT("\n--- CAMERA POSE (CamInHmd) ---\n");
+    
+    const FRotator HardcodedRotator = HardcodedRot.Rotator();
+    Result += FString::Printf(TEXT("Hardcoded: Trans=[%.2f, %.2f, %.2f] cm\n"),
+        HardcodedTrans.X, HardcodedTrans.Y, HardcodedTrans.Z);
+    Result += FString::Printf(TEXT("           Rot=P:%.2f Y:%.2f R:%.2f deg\n"),
+        HardcodedRotator.Pitch, HardcodedRotator.Yaw, HardcodedRotator.Roll);
+    
+    if (bHaveRuntimePose)
+    {
+        const FRotator RuntimeRotator = GCameraPoseRotation.Rotator();
+        Result += FString::Printf(TEXT("Runtime:   Trans=[%.2f, %.2f, %.2f] cm\n"),
+            GCameraPoseTranslation.X, GCameraPoseTranslation.Y, GCameraPoseTranslation.Z);
+        Result += FString::Printf(TEXT("           Rot=P:%.2f Y:%.2f R:%.2f deg\n"),
+            RuntimeRotator.Pitch, RuntimeRotator.Yaw, RuntimeRotator.Roll);
+        
+        // Differences
+        const FVector TransDelta = GCameraPoseTranslation - HardcodedTrans;
+        const float TransDist = TransDelta.Size();
+        
+        // Angular difference between quaternions
+        const float AngleDiffRad = GCameraPoseRotation.AngularDistance(HardcodedRot);
+        const float AngleDiffDeg = FMath::RadiansToDegrees(AngleDiffRad);
+        
+        Result += FString::Printf(TEXT("Delta:     Trans dist=%.2f cm, Rot diff=%.2f deg\n"),
+            TransDist, AngleDiffDeg);
+        
+        if (TransDist > 0.5f || AngleDiffDeg > 1.0f)
+        {
+            Result += TEXT("\n>>> WARNING: Significant pose differences detected!\n");
+            Result += TEXT("    This could cause systematic angular errors in colocation.\n");
+        }
+    }
+    else
+    {
+        Result += TEXT("Runtime:   NOT AVAILABLE - using hardcoded values\n");
+    }
+    
+    // WHAT'S ACTUALLY BEING USED
+    Result += TEXT("\n--- CURRENTLY ACTIVE ---\n");
+    Result += FString::Printf(TEXT("Intrinsics source: %s\n"), 
+        bHaveRuntimeIntrinsics ? TEXT("RUNTIME (from device)") : TEXT("HARDCODED (reference values)"));
+    Result += FString::Printf(TEXT("Pose source: %s\n"), 
+        bHaveRuntimePose ? TEXT("RUNTIME (from device)") : TEXT("HARDCODED (reference values)"));
+    
+    return Result;
 }
