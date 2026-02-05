@@ -55,6 +55,8 @@ public class Camera2Helper {
     private static native void onPixelArraySizeAvailable(int width, int height);
     private static native void onActiveArraySizeAvailable(int width, int height);
     private static native void onCharacteristicsDumpAvailable(String json);
+    private static native void onCameraSelected(String cameraId, boolean isLeftCamera);
+    private static native void onCameraPoseAvailable(float tx, float ty, float tz, float qx, float qy, float qz, float qw);
     
     private Camera2Helper(Context ctx) {
         this.context = ctx;
@@ -137,28 +139,56 @@ public class Camera2Helper {
             
             // Check all cameras and their characteristics - prioritize Quest 3 special cameras
             String cameraId = null;
+            boolean isLeftCamera = false;
             
-            // First pass: look for Quest 3 special cameras (50, 51)
+            // First pass: look for Quest 3 special cameras (50 = left, 51 = right)
+            boolean has50 = false;
+            boolean has51 = false;
             for (String id : cameraIds) {
-                if (id.equals("50") || id.equals("51")) {
-                    Log.d(TAG, "=== Camera ID: " + id + " (PRIORITY) ===");
-                    try {
-                        CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(id);
-                        Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
-                        String facingStr = "UNKNOWN";
-                        if (facing != null) {
-                            if (facing == CameraCharacteristics.LENS_FACING_FRONT) facingStr = "FRONT";
-                            else if (facing == CameraCharacteristics.LENS_FACING_BACK) facingStr = "BACK";
-                            else if (facing == CameraCharacteristics.LENS_FACING_EXTERNAL) facingStr = "EXTERNAL";
-                        }
-                        Log.d(TAG, "Priority Camera " + id + " facing: " + facingStr + " (value=" + facing + ")");
-                        
-                        cameraId = id;
-                        Log.d(TAG, "Selected Quest 3 special camera ID: " + id + " (" + facingStr + ")");
-                        break; // Use first special camera found
-                    } catch (Exception e) {
-                        Log.w(TAG, "Could not get characteristics for priority camera " + id + ": " + e.getMessage());
+                if (id.equals("50")) has50 = true;
+                if (id.equals("51")) has51 = true;
+            }
+            
+            // Use the camera based on preference (set via setPreferredCamera)
+            Log.d(TAG, "Camera preference: " + (preferLeftCamera ? "LEFT" : "RIGHT"));
+            
+            if (preferLeftCamera) {
+                // Prefer left camera (50)
+                if (has50) {
+                    cameraId = "50";
+                    isLeftCamera = true;
+                    Log.d(TAG, "Selected Quest 3 LEFT camera (ID 50) - matches preference");
+                } else if (has51) {
+                    cameraId = "51";
+                    isLeftCamera = false;
+                    Log.d(TAG, "Selected Quest 3 RIGHT camera (ID 51) - fallback (left not available)");
+                }
+            } else {
+                // Prefer right camera (51)
+                if (has51) {
+                    cameraId = "51";
+                    isLeftCamera = false;
+                    Log.d(TAG, "Selected Quest 3 RIGHT camera (ID 51) - matches preference");
+                } else if (has50) {
+                    cameraId = "50";
+                    isLeftCamera = true;
+                    Log.d(TAG, "Selected Quest 3 LEFT camera (ID 50) - fallback (right not available)");
+                }
+            }
+            
+            if (cameraId != null) {
+                try {
+                    CameraCharacteristics characteristics = cameraManager.getCameraCharacteristics(cameraId);
+                    Integer facing = characteristics.get(CameraCharacteristics.LENS_FACING);
+                    String facingStr = "UNKNOWN";
+                    if (facing != null) {
+                        if (facing == CameraCharacteristics.LENS_FACING_FRONT) facingStr = "FRONT";
+                        else if (facing == CameraCharacteristics.LENS_FACING_BACK) facingStr = "BACK";
+                        else if (facing == CameraCharacteristics.LENS_FACING_EXTERNAL) facingStr = "EXTERNAL";
                     }
+                    Log.d(TAG, "Quest 3 Camera " + cameraId + " facing: " + facingStr + " (isLeft=" + isLeftCamera + ")");
+                } catch (Exception e) {
+                    Log.w(TAG, "Could not get characteristics for camera " + cameraId + ": " + e.getMessage());
                 }
             }
             
@@ -217,6 +247,16 @@ public class Camera2Helper {
             }
             // Remember selection for dumps
             this.currentCameraId = cameraId;
+            this.currentIsLeftCamera = isLeftCamera;
+            
+            // Notify native side which camera was selected
+            try {
+                onCameraSelected(cameraId, isLeftCamera);
+                Log.d(TAG, "Notified native: camera=" + cameraId + " isLeft=" + isLeftCamera);
+            } catch (Exception e) {
+                Log.w(TAG, "Failed to notify camera selection: " + e.getMessage());
+            }
+            
             // Trigger an immediate dump of characteristics for this camera
             try { dumpCameraCharacteristics(); } catch (Exception e) { Log.w(TAG, "Auto dump failed: " + e.getMessage()); }
             
@@ -314,10 +354,39 @@ public class Camera2Helper {
                     Log.d(TAG, "No distortion array available on this device");
                 }
 
+                // CRITICAL: Compute intrinsics adjusted for the output stream resolution (center crop + scale)
+                // The raw intrinsics are for the full sensor (e.g., 1280x1280), but we're outputting
+                // a different resolution (e.g., 1280x960). The principal point especially needs adjustment.
                 Intr kStream = intrinsicsForStream(fx, fy, cx, cy, srcW, srcH, frameWidth, frameHeight);
-                onIntrinsicsAvailable(fx, fy, cx, cy, skew, frameWidth, frameHeight);
+                
+                Log.d(TAG, "Original intrinsics: fx=" + fx + " fy=" + fy + " cx=" + cx + " cy=" + cy + " (for " + srcW + "x" + srcH + ")");
+                Log.d(TAG, "Adjusted intrinsics: fx=" + kStream.fx + " fy=" + kStream.fy + " cx=" + kStream.cx + " cy=" + kStream.cy + " (for " + frameWidth + "x" + frameHeight + ")");
+                
+                // Send ADJUSTED intrinsics that match the output stream resolution
+                onIntrinsicsAvailable(kStream.fx, kStream.fy, kStream.cx, kStream.cy, skew, frameWidth, frameHeight);
 
                 onOriginalResolutionAvailable(srcW, srcH); // keep sending this if your native side logs it
+                
+                // Try to extract and send camera pose (CamInHmd) if available
+                try {
+                    float[] poseTranslation = cc.get(CameraCharacteristics.LENS_POSE_TRANSLATION);
+                    float[] poseRotation = cc.get(CameraCharacteristics.LENS_POSE_ROTATION);
+                    if (poseTranslation != null && poseTranslation.length >= 3 &&
+                        poseRotation != null && poseRotation.length >= 4) {
+                        // Pose translation is in meters, rotation is quaternion (x, y, z, w)
+                        Log.d(TAG, "Camera pose found - Translation: [" + 
+                              poseTranslation[0] + ", " + poseTranslation[1] + ", " + poseTranslation[2] + "]");
+                        Log.d(TAG, "Camera pose found - Rotation: [" + 
+                              poseRotation[0] + ", " + poseRotation[1] + ", " + poseRotation[2] + ", " + poseRotation[3] + "]");
+                        onCameraPoseAvailable(
+                            poseTranslation[0], poseTranslation[1], poseTranslation[2],
+                            poseRotation[0], poseRotation[1], poseRotation[2], poseRotation[3]);
+                    } else {
+                        Log.d(TAG, "Camera pose not available from characteristics");
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "Failed to get camera pose: " + e.getMessage());
+                }
 
             } catch (Exception e) {
                 Log.w(TAG, "Failed to get intrinsics: "+e.getMessage());
@@ -411,6 +480,29 @@ public class Camera2Helper {
 
     // Remember currently selected camera for dumps
     private String currentCameraId;
+    // Remember if current camera is left (50) or right (51)
+    private boolean currentIsLeftCamera;
+    
+    // Static preference for which camera to use (set before startCamera)
+    // true = left camera (ID 50), false = right camera (ID 51)
+    private static boolean preferLeftCamera = true;
+    
+    /**
+     * Set the preferred camera before calling startCamera.
+     * @param useLeft true for left camera (ID 50), false for right camera (ID 51)
+     */
+    public static void setPreferredCamera(boolean useLeft) {
+        preferLeftCamera = useLeft;
+        Log.d(TAG, "Camera preference set to: " + (useLeft ? "LEFT (50)" : "RIGHT (51)"));
+    }
+    
+    /**
+     * Get the current camera preference.
+     * @return true if left camera is preferred
+     */
+    public static boolean getPreferredCamera() {
+        return preferLeftCamera;
+    }
 	// Remember last saved dump file path
 	private String lastCharacteristicsDumpPath;
 	// Remember last JSON text
