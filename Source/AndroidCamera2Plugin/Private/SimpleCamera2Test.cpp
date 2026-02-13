@@ -165,14 +165,17 @@ namespace Quest3Calibration
         
         // Step 4: Convert Unity (X-right, Y-up, Z-forward) to UE (X-forward, Y-right, Z-up)
         // Axis mapping: Unity_Z → UE_X, Unity_X → UE_Y, Unity_Y → UE_Z
-        // 
-        // However, the pitch direction needs to match physical reality:
-        // - Quest 3 cameras point ~11° DOWN
-        // - In UE, negative pitch = looking down
-        // - Unity's positive pitch around X corresponds to UE's negative pitch around Y
-        // 
-        // We negate the Y component to correct the pitch direction
-        FQuat UEQuat(bz, -bx, by, bw);  // Note: -bx to flip pitch direction
+        //
+        // Unity X (right) is the pitch axis; UE Y (right) is the pitch axis.
+        // Both engines are left-handed, so positive rotation around the right
+        // axis tilts the forward vector DOWNWARD in both systems.
+        // Therefore the pitch component maps 1:1 -- NO sign flip.
+        //
+        // Previous code had "-bx" which INVERTED the camera's 11° downward
+        // tilt to 11° upward, causing every tag's world position to have a
+        // ~38% vertical error that rotated with HMD orientation -- the root
+        // cause of catastrophic Z-component disagreement between players.
+        FQuat UEQuat(bz, bx, by, bw);
         UEQuat.Normalize();
         
         return UEQuat;
