@@ -1,5 +1,7 @@
 ## meta quest camera2 plugin for unreal engine
 
+<img src="Resources/Icon128.png" width="128" alt="Android Camera2 plugin icon">
+
 simple, fast camera2 access for unreal engine projects on android and meta quest. streams camera frames into a UE texture for realtime use in games and XR apps. this is a fork of the original by @tark146 but since they are not seeming to be merging pull requests - this is now where I will be maintaining and pushing changes.
 
 ### what it does
